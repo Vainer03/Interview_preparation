@@ -4,6 +4,7 @@ Messaging interface for RabbitMQ integration
 import json
 import logging
 import threading
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, List, Tuple
 from pydantic import BaseModel, field_validator
@@ -27,6 +28,7 @@ except ImportError:
 
 
 class MessagePriorityLevel(IntEnum):
+    """A IntEnum class for message priority levels"""
     LOWEST = 0
     LOW = 1
     MEDIUM = 2
@@ -35,6 +37,7 @@ class MessagePriorityLevel(IntEnum):
 
 
 class NotificationType(str, Enum):
+    """A Enum class for types of notifications"""
     EMAIL = "email"
     SMS = "sms"
     PUSH = "push"
@@ -44,7 +47,6 @@ class NotificationType(str, Enum):
 
 class MessageHandler(ABC):
     """Abstract base class for message handlers"""
-
     @abstractmethod
     async def handle(self, message: Dict[str, Any]) -> None:
         """Handle incoming message"""
@@ -62,7 +64,7 @@ class NotificationMessage(BaseModel):
     related_object_type: Optional[str] = None
     timestamp: Optional[str] = None
     priority: MessagePriorityLevel = MessagePriorityLevel.MEDIUM
-   
+
     def __init__(self, **data):
         if 'timestamp' not in data:
             data['timestamp'] = datetime.now().isoformat()
@@ -74,9 +76,8 @@ class NotificationMessage(BaseModel):
             raise ValueError("Field cannot be empty")
         return v.strip()
 
-
 class RabbitMQConfig(BaseModel):
-    """Configuration model for RabbitMQ connection"""
+    """Configuration model for the RabbitMQ connection"""
     host: str = "host.docker.internal"
     port: int = 5672
     username: str = "guest"
@@ -84,6 +85,8 @@ class RabbitMQConfig(BaseModel):
     virtual_host: str = "/"
     heartbeat: int = 60
     connection_timeout: int = 10
+    connection_retries: int = 2
+    retry_delay: int = 3
     max_priority: int = MessagePriorityLevel.HIGHEST.value
 
 
@@ -91,7 +94,7 @@ class MessagingAdapter:
     """RabbitMQ messaging adapter"""
 
     _instance: Optional['MessagingAdapter'] = None
-   
+
     def __new__(cls, config: RabbitMQConfig) -> 'MessagingAdapter':
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -110,10 +113,12 @@ class MessagingAdapter:
         self.config = config
         self.connection: Optional[AbstractConnection] = None
         self.channel: Optional[AbstractChannel] = None
-        self._handlers: Dict[str, MessageHandler] = {}
-        self._consumers: List[Tuple[str, AbstractQueue]] = []
+
         self._exchanges: Dict[str, Exchange] = {}
         self._queues: Dict[str, AbstractQueue] = {}
+        self._handlers: Dict[str, MessageHandler] = {}
+        self._consumers: List[Tuple[str, AbstractQueue]] = []
+        
         self._is_connected = False
         self._initialized = True
 
@@ -127,11 +132,13 @@ class MessagingAdapter:
             f"{self.config.host}:{self.config.port}/{self.config.virtual_host}"
             f"?heartbeat={self.config.heartbeat}"
         )
-   
+
+
     def _reset_connection(self) -> None:
         self.connection = None
         self.channel = None
         self._is_connected = False
+
 
     def is_connected(self) -> bool:
         """Check actual connection state"""
@@ -139,37 +146,49 @@ class MessagingAdapter:
                 self.connection and 
                 not self.connection.is_closed and
                 self.channel and
-                not self.channel.is_closed)    
+                not self.channel.is_closed)   
+
 
     async def connect(self) -> None:
-        """Establish connection to RabbitMQ"""
-        if aio_pika is None:
-            self._reset_connection()
-            logger.error("aio_pika is required but not installed")
-            raise ConnectionError("aio_pika is required but not installed")
-
-        if self._is_connected:
-            logger.debug("Already connected to RabbitMQ")
+        """Establish connection with guaranteed error handling"""
+        if self.is_connected():
             return
 
-        try:
-            # Explicitly use the module's connect_robust
-            self.connection = await aio_pika.connect_robust(
-                self._get_connection_url(),
-                timeout=self.config.connection_timeout
-            )
-            self.channel = await self.connection.channel()
-            await self.channel.set_qos(prefetch_count=10)
-            self._is_connected = True
-            logger.info("Connected to RabbitMQ")
-        except AMQPError as e:
-            self._reset_connection()
-            logger.error(f"Failed to connect to RabbitMQ: {e}")
-            raise ConnectionError(f"Failed to connect to RabbitMQ: {e}")
-        except Exception as e:
-            self._reset_connection()
-            logger.error(f"Unexpected error connecting to RabbitMQ: {e}")
-            raise ConnectionError(f"Unexpected error connecting to RabbitMQ: {e}")
+        if aio_pika is None:
+            raise ConnectionError("aio_pika is required but not installed")
+
+        last_error = None
+        for attempt in range(self.config.connection_retries):
+            try:
+                # Clean up any existing connection
+                if self.connection:
+                    await self.connection.close()
+                self._reset_connection()
+
+                # Attempt connection
+                self.connection = await aio_pika.connect_robust(
+                    self._get_connection_url(),
+                    timeout=self.config.connection_timeout
+                )
+                self.channel = await self.connection.channel()
+                await self.channel.set_qos(prefetch_count=10)
+                self._is_connected = True
+                logger.info(f"Connected to RabbitMQ (attempt {attempt + 1})")
+                return
+
+            except Exception as e:  # Catch all connection errors
+                last_error = e
+                logger.warning(f"Connection attempt {attempt + 1} failed: {str(e)}")
+                if attempt < self.config.connection_retries - 1:
+                    await asyncio.sleep(self.config.retry_delay)
+                continue
+
+        # If we get here, all attempts failed
+        self._reset_connection()
+        raise ConnectionError(
+            f"Failed to connect after {self.config.connection_retries} attempts. "
+            f"Last error: {str(last_error)}"
+        ) from last_error
 
     async def disconnect(self) -> None:
         """Close RabbitMQ connection"""
@@ -188,7 +207,15 @@ class MessagingAdapter:
             self._reset_connection()
 
 
-    
+    @asynccontextmanager
+    async def connection_context(self) -> Any:
+        """Context manager for connection handling."""
+        try:
+            if not self._is_connected:
+                await self.connect()
+            yield self
+        finally:
+            await self.disconnect()
 
 
     async def declare_queue(
@@ -305,12 +332,10 @@ class MessagingAdapter:
             return False
 
 
-
-
     async def publish_notification(self, notification: NotificationMessage) -> bool:
         """Publish notification with proper routing"""
         exchange_name = "notifications_exchange"
-        routing_key = f"notification.{notification.notification_type.value}.{notification.priority.name.lower()}"
+        routing_key = f"notification.{notification.notification_type}.{notification.priority.name.lower()}"
        
         return await self.publish(
             exchange_name=exchange_name,
@@ -430,16 +455,6 @@ class MessagingAdapter:
         )
 
 
-        for n_type in NotificationType:
-            queue_name = f"notifications_{n_type.value}"
-            await self.declare_queue(queue_name, durable=True)
-            await self.bind_queue(
-                queue_name,
-                "notifications_exchange",
-                f"notification.{n_type.value}"
-            )
-            logger.info(f"Configured notification queue for {n_type.value}")
-
     async def get_queue_info(self,
                             queue_name: str,
                             include_messages: bool = False,
@@ -514,8 +529,8 @@ class MessagingAdapter:
             return None
 
 
-
-
+# Global messaging adapter instance
+messaging_adapter: Optional[MessagingAdapter] = None
 
 
 # Global messaging adapter instance
@@ -535,5 +550,6 @@ async def get_messaging_adapter(
                     config = RabbitMQConfig()
                 _messaging_adapter = MessagingAdapter(config)
                 await _messaging_adapter.connect()
+                await _messaging_adapter.setup_notification_infrastructure()
     
     return _messaging_adapter
