@@ -1,0 +1,11 @@
+route:
+  receiver: 'telegram'
+
+receivers:
+  - name: 'telegram'
+    telegram_configs:
+      - bot_token: '6287045828:AAH31lrxkK64x_GL_Ce61Fjp1S-qZbSewk4'
+        chat_id: 6287045828
+        message: |
+          🔴 АЛЕРТ: {{ .CommonAnnotations.summary }}
+          {{ .CommonAnnotations.description }}
