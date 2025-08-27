@@ -52,7 +52,6 @@ class MessageHandler(ABC):
     @abstractmethod
     async def handle(self, message: Dict[str, Any]) -> None:
         """Handle incoming message"""
-        raise NotImplementedError
 
 
 class NotificationMessage(BaseModel):
@@ -123,13 +122,6 @@ class MessagingAdapter:
         self.channel = None
         self._is_connected = False
 
-    def is_connected(self) -> bool:
-        """Check actual connection state"""
-        return (self._is_connected and 
-                self.connection and 
-                not self.connection.is_closed and
-                self.channel and
-                not self.channel.is_closed)
 
     async def connect(self) -> None:
         """Establish connection with guaranteed error handling"""
@@ -625,35 +617,61 @@ class MessagingAdapter:
 
 # Global messaging adapter instance
 _messaging_adapter_lock = threading.Lock()
-_messaging_adapter: Optional[MessagingAdapter] = None
+_messaging_adapters: Dict[str, MessagingAdapter] = {}
 
 
 async def get_messaging_adapter(
     config: Optional[RabbitMQConfig] = None,
-    service_name: Optional[str] = None
+    service_name: Optional[str] = None,
+    reconnect: bool = False
 ) -> MessagingAdapter:
-    """Thread-safe access to global messaging adapter"""
-    global _messaging_adapter
+    """
+    Get or create a messaging adapter instance.
     
-    if _messaging_adapter is None:
-        with _messaging_adapter_lock:
-            if _messaging_adapter is None:  # Double-check pattern
-                if config is None:
-                    config = RabbitMQConfig()
-                _messaging_adapter = MessagingAdapter(config, service_name)
-                await _messaging_adapter.connect()
-                await _messaging_adapter.setup_notification_infrastructure()
+    Args:
+        config: RabbitMQ configuration (optional)
+        service_name: Service name for service-specific queues. 
+                     If None, creates a shared adapter.
+        reconnect: Force reconnection even if adapter exists
     
-    return _messaging_adapter
+    Returns:
+        MessagingAdapter instance
+    """
+    global _messaging_adapters
+    
+    adapter_key = service_name or "shared"
+    
+    with _messaging_adapter_lock:
+        if adapter_key in _messaging_adapters and not reconnect:
+            adapter = _messaging_adapters[adapter_key]
+            # Ensure adapter is connected
+            if not adapter.is_connected():
+                await adapter.connect()
+            return adapter
+        
+        # Create new adapter
+        if config is None:
+            config = RabbitMQConfig()
+        
+        adapter = MessagingAdapter(config, adapter_key)
+        await adapter.connect()
+        await adapter.setup_notification_infrastructure()
+        
+        _messaging_adapters[adapter_key] = adapter
+        return adapter
 
 
-def create_service_adapter(service_name: str, config: Optional[RabbitMQConfig] = None) -> MessagingAdapter:
-    """Create messaging adapter for specific service"""
-    adapter = MessagingAdapter(config, service_name)
-    return adapter
-
-
-def create_shared_adapter(config: Optional[RabbitMQConfig] = None) -> MessagingAdapter:
-    """Create messaging adapter for shared queues (no service-specific naming)"""
-    adapter = MessagingAdapter(config)
-    return adapter
+async def close_all_adapters() -> None:
+    """
+    Close all messaging adapter connections.
+    """
+    global _messaging_adapters
+    
+    with _messaging_adapter_lock:
+        for adapter_key, adapter in list(_messaging_adapters.items()):
+            try:
+                await adapter.disconnect()
+            except Exception as e:
+                logger.error(f"Error closing adapter {adapter_key}: {e}")
+        
+        _messaging_adapters.clear()
